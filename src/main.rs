@@ -12,15 +12,7 @@ The server recieves messages via a tokio MPSC channel. This message communicates
 
 */
 
-/*
-
-Limitations
-- Currently have no way to support multi threaded simulations where
-  a single actor gets a response from two other actors.
-
-*/
-
-use actor::{actor::ActorServer, operations::Message};
+use actor::{actor::ActorServer, message::Message};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -32,44 +24,4 @@ async fn main() {
     let server = ActorServer::new(actor_reciever);
     server.start();
 
-    let message = Message::new(
-        actor::operations::Operation::INSERT {
-            key: "key",
-            value: "some value",
-        },
-        message_sender.clone(),
-    );
-
-    // Set a key and value
-    client_sender.send(message).expect("failed to send");
-
-    let message_two = Message::new(
-        actor::operations::Operation::GET { key: "key" },
-        message_sender.clone(),
-    );
-
-    client_sender
-        .send(message_two)
-        .expect("failed to send message two");
-
-    while let Some(m) = client_reciever.recv().await {
-        println!("[Client]: Got response: {}", m);
-        break;
-    }
-
-    let message_three = Message::new(
-        actor::operations::Operation::DELETE { key: "key" },
-        message_sender.clone(),
-    );
-
-    client_sender
-        .send(message_three)
-        .expect("failed to send message three");
-    while let Some(m) = client_reciever.recv().await {
-        println!("[Client]: Sent delete request, got response: <{}>", m);
-        break;
-    }
-
-    println!("[Client]: jobs are done, shutting down...");
-    std::process::exit(0);
 }
