@@ -1,51 +1,34 @@
 use crate::message::Message;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::Mutex;
-use tokio::{
-    sync::mpsc::{self, UnboundedReceiver},
-    task::JoinHandle,
-};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// An agent in a network of >= 1 nodes.
 ///
 /// This structure models a single actor with it's own backing
 /// datastore.
-pub struct ActorServer<K, V, T>
-where
-    K: Eq + PartialEq + Copy + Clone + Hash + Send + Sync + 'static,
-    V: Display + Copy + Clone + Send + Sync + 'static,
-    T: Send + Copy + Clone + 'static,
-{
+pub struct ActorServer<K, V> {
     /// Actors identifier
     id: Uuid,
     /// This actor servers' recieving channel
-    reciever: mpsc::UnboundedReceiver<Message<K, V, T>>,
-    /// Ideally a mechanism to help back-log messages recv'd
-    // message_queue: Vec<Message<K, V, T>>,
+    reciever: mpsc::UnboundedReceiver<Message<K, V>>,
     /// This actor servers' local "db"
-    db: Arc<Mutex<HashMap<K, V>>>,
+    db: HashMap<K, V>,
 }
 
-impl<K, V, T> ActorServer<K, V, T>
-where
-    K: Eq + PartialEq + Copy + Clone + Hash + Send + Sync + ToString + 'static,
-    V: Display + Copy + Clone + Send + Sync + 'static,
-    T: Send + Copy + Clone + ToString + 'static,
-{
+impl<K, V> ActorServer<K, V> {
     /// A constructor method that will use a specified reciever
     /// and then default the `message_queue` and initialize the
     /// backing data store.
-    pub fn new(reciever: UnboundedReceiver<Message<K, V, T>>) -> Self {
+    pub fn new(reciever: UnboundedReceiver<Message<K, V>>) -> Self {
         let id: Uuid = Uuid::new_v4();
         ActorServer {
             id,
             reciever,
-            // message_queue: Vec::new(),
-            db: Arc::new(Mutex::new(HashMap::new())),
+            db: HashMap::new(),
         }
     }
 
@@ -59,66 +42,57 @@ where
     pub fn log(&self, info: &str) {
         println!("[Server {}]: {}", self.id(), info);
     }
+}
 
+impl<K, V> ActorServer<K, V>
+where
+    K: Send + Eq + PartialEq + Hash + Clone + 'static,
+    V: Display + Send + Clone + 'static,
+{
     /// Takes our actor and spins off a new tokio thread ("task").
-    pub fn start(mut self) -> JoinHandle<()> {
-        self.log(&format!("Starting up actor..."));
+    pub fn start(mut self) {
+        self.log("Starting up actor...");
         tokio::spawn(async move {
             loop {
-                match self.reciever.try_recv() {
-                    Ok(m) => match m {
-                        Message::GET { ref key, resp } => {
-                            let db = self.db.lock().await;
-                            println!(
-                                "[Server {}]: Getting value from key: {}",
-                                self.id(),
-                                key.to_string()
-                            );
-                            let r = db.get(key).cloned();
-                            let _ = resp.send(r);
-                        }
-                        Message::INSERT { key, value, resp } => {
-                            let mut db = self.db.lock().await;
-                            println!(
-                                "[Server {}]: Inserting a new value: {}",
-                                self.id(),
-                                value.to_string()
-                            );
-                            db.insert(key.clone(), value.clone());
-                            let _ = resp.send(());
-                        }
-                        Message::DELETE { ref key, resp } => {
-                            let mut db = self.db.lock().await;
-                            let r = db.remove(key);
-                            let _ = resp.send(r);
-                        }
-                        Message::QUERY { key, func, resp } => {
-                            let db = self.db.lock().await;
-                            println!("[Server {}]: Arbitrary query ...", self.id());
-                            if let Some(val) = db.get(&key) {
-                                // perform arbitrary op and return result
-                                let res = func(val.clone());
-                                let _ = resp.send(Some(res.clone().to_string()));
-                            }
-                        }
-                    },
-                    Err(_e) => {} // TODO: determine what to do in this case
+                match self.reciever.recv().await.unwrap() {
+                    Message::GET { key, resp } => drop(resp.send(self.db.get(&key).cloned())),
+                    Message::INSERT { key, val, resp } => drop(resp.send(self.db.insert(key, val))),
+                    Message::DELETE { key, resp } => drop(resp.send(self.db.remove(&key))),
+                    Message::QUERY { key, func } => drop(self.db.get(&key).map(func)),
                 }
             }
-        })
+        });
     }
 }
 
-/// Utility function to generate a new actor server
-pub fn generate_actor<K, V, T>() -> (ActorServer<K, V, T>, UnboundedSender<Message<K, V, T>>)
+#[derive(Debug)]
+pub struct ActorClient<U> {
+    /// The channel the query response would come back on
+    pub handle: oneshot::Receiver<U>,
+}
+
+impl<U> ActorClient<U> {
+    /// Creates a new `ActorClient`
+    pub fn new(handle: oneshot::Receiver<U>) -> Self {
+        Self { handle }
+    }
+}
+
+/// Send a query to an active node and perform some arbitary function, with any results
+/// being sent back via interior channels.
+pub async fn query<K, V, U>(
+    key: K,
+    func: Box<dyn 'static + Send + FnOnce(&V) -> U>,
+    server: UnboundedSender<Message<K, V>>,
+) -> ActorClient<U>
 where
-    K: Eq + PartialEq + Copy + Clone + Hash + Send + Sync + ToString + 'static,
-    V: Display + Copy + Clone + Send + Sync + 'static,
-    T: Send + Copy + Clone + 'static + ToString,
+    V: Send + 'static,
+    U: Send + 'static,
 {
-    // Future Considerations:
-    // - Consider creating a bounded channel
-    // - Perhaps wrap the `actor_reciever` as a type so this function becomes a method
-    let (sender, actor_reciever) = mpsc::unbounded_channel();
-    (ActorServer::new(actor_reciever), sender)
+    let (send, recv) = oneshot::channel();
+    drop(server.send(Message::QUERY {
+        key,
+        func: { Box::new(move |v| drop(send.send(func(v)))) },
+    }));
+    ActorClient { handle: recv }
 }

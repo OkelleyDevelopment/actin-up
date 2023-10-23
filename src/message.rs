@@ -5,20 +5,15 @@ use tokio::sync::oneshot;
 // To model the supported operations in the 'server'. Originally just the type of operation,
 // I've now elected to create this enum with state inside the variant so it's
 // nearly impossible to send an incorrect message.
-pub enum Message<K, V, T>
-where
-    K: Copy + Clone + Send + Sync,
-    V: Copy + Clone + Send + Sync,
-    T: Copy + Clone + Send,
-{
+pub enum Message<K, V> {
     GET {
         key: K,
         resp: oneshot::Sender<Option<V>>,
     },
     INSERT {
         key: K,
-        value: V,
-        resp: oneshot::Sender<()>,
+        val: V,
+        resp: oneshot::Sender<Option<V>>,
     },
     DELETE {
         key: K,
@@ -26,20 +21,6 @@ where
     },
     QUERY {
         key: K,
-        func: Box<dyn FnOnce(V) -> T + Send>,
-        resp: oneshot::Sender<Option<String>>,
+        func: Box<dyn Send + 'static + FnOnce(&V)>,
     },
-}
-
-#[derive(Clone, Copy)]
-pub enum QueryResponse {
-    Count(usize),
-}
-
-impl ToString for QueryResponse {
-    fn to_string(&self) -> String {
-        match self {
-            QueryResponse::Count(c) => c.to_string(),
-        }
-    }
 }
