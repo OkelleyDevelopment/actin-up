@@ -1,29 +1,43 @@
-use actor::actor::generate_actor;
-use actor::logging::await_response;
-use actor::message::QueryResponse;
-use actor::{actor::ActorServer, message::Message};
+use actor::{
+    actor::{query, ActorServer},
+    logging::await_response,
+    message::Message,
+};
 use std::collections::HashMap;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
+use tokio::sync::{
+    mpsc::{self, UnboundedSender},
+    oneshot,
+};
 use uuid::Uuid;
 
-// TODO: Createa formal actor for this...
-/// Actor responsible for sending and receiving messages.
-async fn message_handling_actor(
-    client_handles: HashMap<Uuid, UnboundedSender<Message<&str, &str, QueryResponse>>>,
-) {
+#[tokio::main]
+async fn main() {
+    let mut servers_to_start: Vec<ActorServer<&str, &str>> = Vec::new();
+    let mut client_handles: HashMap<Uuid, UnboundedSender<Message<_, _>>> = HashMap::new();
+    // Spawn the unique servers
+    for _ in 0..=1 {
+        // Creates the server and sender
+        let (sender, actor_reciever) = mpsc::unbounded_channel();
+        let server = ActorServer::new(actor_reciever);
+        client_handles.insert(server.id(), sender);
+        servers_to_start.push(server);
+    }
+
+    // Start the actor threads
+    for s in servers_to_start {
+        s.start();
+    }
+
     println!("[Messenger]: Beginning tasks...");
     let fish = ["salmon", "bass"];
-    let mut index: usize = 0;
-    for key in client_handles.keys() {
+    for (index, key) in client_handles.keys().enumerate() {
         let handle = client_handles.get(key).unwrap();
         let (sender, _recv) = oneshot::channel();
         let _ = handle.send(Message::INSERT {
             key: "fish",
-            value: fish[index],
+            val: fish[index],
             resp: sender,
         });
-        index = index + 1;
 
         let (sender, mut recv) = oneshot::channel();
 
@@ -34,41 +48,19 @@ async fn message_handling_actor(
 
         await_response(&mut recv, "Messenger").await;
 
-        let (sender, mut recv) = oneshot::channel();
-        let _ = handle.send(Message::QUERY {
-            key: "fish",
-            func: Box::new(|s| QueryResponse::Count(s.len())),
-            resp: sender,
-        });
+        let handle = client_handles.get(key).unwrap().clone();
+        let res = query(
+            "fish",
+            Box::new(move |v| if *v == "bass" { 42 } else { 25 }),
+            handle,
+        )
+        .await;
 
-        await_response(&mut recv, "Messenger").await;
+        match res.handle.await {
+            Ok(v) => println!("The result recieved for the query: {}", v),
+            Err(e) => panic!("Failed to query. Message: {}", e),
+        }
     }
-    println!("[Messenger]: is done...");
-}
-
-#[tokio::main]
-async fn main() {
-    let mut servers_to_start: Vec<ActorServer<&str, &str, QueryResponse>> = Vec::new();
-    let mut client_handles: HashMap<Uuid, UnboundedSender<Message<_, _, _>>> = HashMap::new();
-    // Spawn the unique servers
-    for _ in 0..=1 {
-        // Creates the server and sender
-        let (server, client_sender) = generate_actor();
-        client_handles.insert(server.id(), client_sender);
-        servers_to_start.push(server);
-    }
-
-    // Start the actor threads
-    for s in servers_to_start {
-        s.start();
-    }
-
-    // Start the message handling actor
-    let message_handle = tokio::spawn(message_handling_actor(client_handles.clone()));
-
-    // Wait for the message handling actor to finish
-    message_handle.await.expect("Message handling actor failed");
-
     println!("Main is done...");
     std::process::exit(0);
 }
